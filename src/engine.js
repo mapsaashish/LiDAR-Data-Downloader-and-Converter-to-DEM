@@ -1,3 +1,4 @@
+import { workerRequest, startProcessing, storedProcessing, readProcessing, cancelProcessing, resultURL, forgetProcessing } from './processing.js';
 import { loadCatalog } from './catalog.js';
 const $=id=>document.getElementById(id);
 const census='https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer';
@@ -27,12 +28,23 @@ function geometryFilter(shape,signal){
   const send=data=>new Promise((resolve,reject)=>{signal.throwIfAborted();const key=++id;pending.set(key,{resolve,reject});worker.postMessage({...data,id:key});});
   return {ready:send({type:'init',shape}),processPage:rows=>send({type:'filter',rows}),close};
 }
+function tileDetails(item,pinned=false){
+  const panel=document.createElement('div');panel.className='tile-detail';
+  const title=document.createElement('strong');title.textContent=item.title||'USGS LiDAR tile';panel.append(title);
+  const details=document.createElement('dl');
+  const date=value=>{if(!value)return 'Not provided';const match=String(value).match(/^\d{4}-\d{2}-\d{2}/);return match?match[0]:'Not provided';};
+  const fields=[['Source','USGS National Map · '+(item.sourceName||'3DEP')],['Survey',surveyKey(item).replaceAll('_',' ')],['Published',date(item.publicationDate)],['Updated',date(item.lastUpdated)],['Acquisition date','See survey metadata'],['Format',item.format||'LAS / LAZ'],['File size',Number(item.sizeInBytes)?fmt(Number(item.sizeInBytes)):'Not provided']];
+  for(const [label,value] of fields){const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=value;details.append(dt,dd);}panel.append(details);
+  if(pinned&&item.metaUrl){try{const url=new URL(item.metaUrl);if(url.protocol==='https:'&&(/(^|\.)usgs\.gov$/.test(url.hostname)||/(^|\.)sciencebase\.gov$/.test(url.hostname))){const link=document.createElement('a');link.href=url.href;link.target='_blank';link.rel='noopener';link.textContent='View survey metadata ↗';panel.append(link);}}catch{}}
+  if(!pinned){const hint=document.createElement('small');hint.textContent='Click the tile to pin details and open metadata.';panel.append(hint);}
+  return panel;
+}
 async function search(){if(!countyShape||busy)return;if(!window.turf){message('Geometry library failed to load. Reload this page to retry.');return;}reset();busy=true;controls();searchController=new AbortController();$('cancel').hidden=false;let filter;const started=performance.now();try{
 const searchArea=activeArea();filter=geometryFilter(searchArea,searchController.signal);
 await filter.ready;
 message('Searching USGS with up to 4 parallel catalog requests…');
 const found=await loadCatalog({bbox:turf.bbox(searchArea),signal:searchController.signal,processPage:filter.processPage,onProgress:({completed,total,retrying})=>message(`${retrying?'USGS is busy; retrying with backoff…':'Parallel search ·'} ${completed.toLocaleString()} of ${total.toLocaleString()} catalog records checked.`)});
-items=found;populateSurveys();$('tiles').textContent=items.length.toLocaleString();const size=items.reduce((s,i)=>s+(Number(i.sizeInBytes)||0),0);$('size').textContent=fmt(size)+(items.some(i=>!Number(i.sizeInBytes))?' + unknown':'');$('count').textContent=items.length.toLocaleString()+' matching tiles';message(items.length?('Search complete in '+((performance.now()-started)/1000).toFixed(1)+'s. All catalog pages retrieved with up to 4 parallel requests. Overlapping surveys included.'):'No published USGS point-cloud tiles found for this county.');$('list').className='';$('list').replaceChildren();if(!items.length){$('list').className='empty';$('list').textContent='No tiles found. Try another county.';}renderMore();if(map)items.forEach(i=>{const b=i.boundingBox;L.rectangle([[b.minY,b.minX],[b.maxY,b.maxX]],{weight:1,color:'#6e9254',fillOpacity:.12}).addTo(tileLayer);});
+items=found;populateSurveys();$('tiles').textContent=items.length.toLocaleString();const size=items.reduce((s,i)=>s+(Number(i.sizeInBytes)||0),0);$('size').textContent=fmt(size)+(items.some(i=>!Number(i.sizeInBytes))?' + unknown':'');$('count').textContent=items.length.toLocaleString()+' matching tiles';message(items.length?('Search complete in '+((performance.now()-started)/1000).toFixed(1)+'s. All catalog pages retrieved with up to 4 parallel requests. Overlapping surveys included.'):'No published USGS point-cloud tiles found for this county.');$('list').className='';$('list').replaceChildren();if(!items.length){$('list').className='empty';$('list').textContent='No tiles found. Try another county.';}renderMore();if(map)items.forEach(i=>{const b=i.boundingBox;L.rectangle([[b.minY,b.minX],[b.maxY,b.maxX]],{weight:1,color:'#6e9254',fillOpacity:.12}).bindTooltip(()=>tileDetails(i),{sticky:true,direction:'top',opacity:.98,className:'lidar-tile-tooltip'}).bindPopup(()=>tileDetails(i,true),{maxWidth:370}).addTo(tileLayer);});
 }catch(e){reset();message(e.name==='AbortError'?'Search cancelled. No partial download list retained.':'Search failed: '+e.message+' No partial results retained; retry the search.');}finally{filter?.close();busy=false;searchController=null;$('cancel').hidden=true;controls();}}
 function renderMore(){const end=Math.min(visible+100,items.length);for(let n=visible;n<end;n++){const i=items[n],row=document.createElement('div');row.className='row';const icon=document.createElement('span');icon.className='fileicon';icon.textContent=i.format||'LAZ';const text=document.createElement('div');text.className='filetext';const title=document.createElement('strong');title.textContent=i.title;const detail=document.createElement('small');detail.textContent=(i.sizeInBytes?fmt(Number(i.sizeInBytes)):'Size unknown')+' · Published '+(i.publicationDate||'unknown');text.append(title,detail);const a=document.createElement('a');a.href=i.url;a.textContent='Download ↗';a.target='_blank';a.rel='noopener';row.append(icon,text,a);$('list').append(row);}visible=end;$('more').hidden=visible>=items.length;}
 function save(content,name,type){const a=document.createElement('a'),url=URL.createObjectURL(new Blob([content],{type}));a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
@@ -62,20 +74,69 @@ if(map)map.on('draw:created',event=>{
 $('polygon').onclick=()=>drawArea('polygon');$('rectangle').onclick=()=>drawArea('rectangle');
 $('fullcounty').onclick=()=>{if(busy)return;clearArea();reset();$('heading').textContent=countyShape.properties.NAME+', '+$('state').selectedOptions[0].textContent;message('Full county selected. Search again to retrieve all county tiles.');controls();};
 function surveyKey(i){const parts=new URL(i.url).pathname.split('/');const at=parts.indexOf('Projects');if(at<0)return i.title.replace(/\s+\S+$/,'');return parts[at+1]==='legacy'?parts[at+2]:parts[at+1];}
-function populateSurveys(){const surveys=new Map();for(const i of items){const key=surveyKey(i);surveys.set(key,(surveys.get(key)||0)+1);}$('dem-survey').replaceChildren(option('','Choose a source survey'),...Array.from(surveys).sort(([a],[b])=>a.localeCompare(b)).map(([key,count])=>option(key,key.replaceAll('_',' ')+' · '+count+' tiles')));if(surveys.size===1)$('dem-survey').value=surveys.keys().next().value;updateDEM();}
-function resetDEM(){ $('dem-survey').replaceChildren(option('','Search LiDAR first'));$('dem-survey').disabled=true;$('dem-status').textContent='';updateDEM();}
-function updateDEM(){const resolution=Number($('dem-resolution').value),survey=$('dem-survey').value;const ready=items.length>0&&!busy;$('dem-survey').disabled=!ready;$('dem-resolution').disabled=busy;$('dem-job').disabled=!ready||![1,5,10,30].includes(resolution)||!survey;
-  if(resolution&&activeArea()){const cells=Math.ceil(turf.area(activeArea())/(resolution*resolution));$('dem-estimate').textContent=`Approx. ${cells.toLocaleString()} cells inside your area at ${resolution} m (${fmt(cells*4)} uncompressed elevation values). The rectangular raster can be larger. Choose one survey; missing coverage stays NoData.`;}else $('dem-estimate').textContent='Choose a resolution and one source survey. This avoids mixing overlapping surveys and elevation references.';
+let allSurveys=new Map(),streamingKeys=null,sourceCheck=0,checkingSources=false;
+function showSurveyChoices(){
+  const previous=$('dem-survey').value,stream=$('dem-mode').value==='stream';
+  const choices=Array.from(allSurveys).filter(([key])=>!stream||streamingKeys?.has(key)).sort(([a],[b])=>a.localeCompare(b));
+  const placeholder=stream&&checkingSources?'Checking available streaming sources…':choices.length?'Choose an available survey':'No available sources for this mode';
+  $('dem-survey').replaceChildren(option('',placeholder),...choices.map(([key,rows])=>option(key,key.replaceAll('_',' ')+' · '+rows.length+' tiles')));
+  if(choices.some(([key])=>key===previous))$('dem-survey').value=previous;else if(choices.length===1)$('dem-survey').value=choices[0][0];
+  updateDEM();
 }
-function encodeConfig(config){const bytes=new TextEncoder().encode(JSON.stringify(config));let binary='';for(let n=0;n<bytes.length;n+=32768)binary+=String.fromCharCode(...bytes.subarray(n,n+32768));return btoa(binary);}
-async function prepareDEM(){if($('dem-job').disabled)return;const resolution=Number($('dem-resolution').value),survey=$('dem-survey').value,shape=structuredClone(activeArea());const records=items.map((i,n)=>({i,n})).filter(({i})=>surveyKey(i)===survey).map(({i,n})=>({url:i.url,name:filename(i,n),size:Number(i.sizeInBytes)||0}));const center=turf.center(shape).geometry.coordinates;
-  // Local UTM keeps the requested horizontal cell size in metres.
-  const zone=Math.max(1,Math.min(60,Math.floor((center[0]+180)/6)+1));const crs='EPSG:'+((center[1]>=0?32600:32700)+zone);
-  const config={resolution,crs,records,area:shape,geoid:$('county').value,title:$('heading').textContent,survey};
-  $('dem-job').disabled=true;$('dem-status').textContent='Preparing your conversion job…';
-  try{const r=await fetch('dem-converter.py');if(!r.ok)throw Error('Converter template unavailable.');const template=await r.text();if(!template.includes('__LIDAR_ATLAS_CONFIG__'))throw Error('Converter template is invalid.');save(template.replace('__LIDAR_ATLAS_CONFIG__',encodeConfig(config)),`lidar-${config.geoid}-${aoiShape?'aoi-':''}dem-${resolution}m.py`,'text/x-python');window.dispatchEvent(new CustomEvent('lidar:dem-job',{detail:{name:config.title,county_geoid:config.geoid,resolution:config.resolution,survey:config.survey,tile_count:config.records.length}}));$('dem-status').textContent=`Conversion job saved: ${resolution} m, ${records.length.toLocaleString()} tiles, ${crs}. Run the downloaded Python file in your PDAL/GDAL environment. After conversion, a local page offers the GeoTIFF download. Conversion has not started in this web page.`;}catch(error){$('dem-status').textContent=error.message;}finally{updateDEM();}
+async function populateSurveys(){
+  const generation=++sourceCheck;allSurveys=new Map();streamingKeys=null;checkingSources=true;
+  for(const i of items){const key=surveyKey(i);if(!allSurveys.has(key))allSurveys.set(key,[]);allSurveys.get(key).push(i);}
+  showSurveyChoices();$('dem-source-status').textContent='Verifying streaming availability. Only usable sources will be shown.';
+  const surveys=Array.from(allSurveys,([key,rows])=>{const folders=new Map();for(const row of rows){const parts=new URL(row.url).pathname.split('/'),at=parts.findIndex(p=>['LAS','LAZ'].includes(p.toUpperCase())),folder=parts.slice(0,at).join('/');folders.set(folder,{url:row.url});}return {key,records:Array.from(folders.values())};});
+  try{
+    const result=await workerRequest('/sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({surveys}),signal:AbortSignal.timeout(90000)});
+    if(generation!==sourceCheck)return;
+    streamingKeys=new Set(result.sources.filter(source=>source.available).map(source=>source.key));
+    $('dem-source-status').textContent=streamingKeys.size+' verified streaming '+(streamingKeys.size===1?'survey':'surveys')+' available. Unavailable sources are hidden; legacy catalog names are resolved automatically.';
+  }catch(error){if(generation!==sourceCheck)return;streamingKeys=new Set();$('dem-source-status').textContent='Could not verify streaming sources. '+error.message;}
+  finally{if(generation===sourceCheck){checkingSources=false;showSurveyChoices();}}
 }
-$('dem-resolution').onchange=updateDEM;$('dem-survey').onchange=updateDEM;$('dem-job').onclick=prepareDEM;
+function resetDEM(){sourceCheck++;allSurveys=new Map();streamingKeys=null;checkingSources=false;$('dem-source-status').textContent=''; $('dem-survey').replaceChildren(option('','Search LiDAR first'));$('dem-survey').disabled=true;updateDEM();}
+function updateDEM(){const resolution=Number($('dem-resolution').value),survey=$('dem-survey').value;const ready=items.length>0&&!busy&&!($('dem-mode').value==='stream'&&checkingSources);$('dem-survey').disabled=!ready;$('dem-resolution').disabled=busy;$('dem-mode').disabled=busy;$('dem-job').disabled=!ready||![1,5,10,30].includes(resolution)||!survey;
+  if(resolution&&activeArea()){const cells=Math.ceil(turf.area(activeArea())/(resolution*resolution));$('dem-estimate').textContent=`Approx. ${cells.toLocaleString()} cells inside your area at ${resolution} m (${fmt(cells*4)} uncompressed elevation values). The rectangular raster can be larger. The raw-file download total above does not represent streaming transfer size. Missing coverage stays NoData.`;}else $('dem-estimate').textContent='Choose a resolution and one source survey. This avoids mixing overlapping surveys and elevation references.';
+}
+async function checkWorker(){try{const health=await workerRequest('/health');$('worker-status').textContent=health.ready?'This laptop’s worker is online and ready.':'Worker is online, but the processing runtime is incomplete.';}catch(error){$('worker-status').textContent=error.message;}}
+$('worker-check').onclick=checkWorker;checkWorker();
+let currentDEM=null;
+function demProgress(job,handle){
+  $('dem-progress').hidden=false;$('dem-progress').value=job.percent||0;
+  $('dem-percent').textContent=Math.round(job.percent||0)+'%';
+  $('dem-status').textContent=job.message+' Progress is an estimate based on completed work units.';
+  window.dispatchEvent(new CustomEvent('lidar:dem-state',{detail:{...handle.metadata,worker_job_id:handle.id,status:job.status,progress:job.percent||0,message:job.message,output_name:job.output_name||null}}));
+}
+async function followDEM(handle,autoDownload=true){
+  currentDEM=handle;busy=true;controls();$('dem-cancel').hidden=false;$('dem-download').hidden=true;
+  let errors=0;
+  try{for(;;){
+    let job;try{job=await readProcessing(handle);errors=0;}catch(error){if(++errors>=3)throw error;$('dem-status').textContent='Worker connection interrupted. Retrying…';await new Promise(resolve=>setTimeout(resolve,2500));continue;}
+    demProgress(job,handle);
+    if(job.status==='complete'){
+      $('dem-download').href=resultURL(handle);$('dem-download').hidden=false;
+      $('dem-status').textContent='100% · '+handle.metadata.name+' · '+handle.metadata.resolution+' m DEM created and verified. '+(autoDownload?'Starting the GeoTIFF download. ':'')+'Use Download DEM if your browser blocks the automatic download. Your browser shows final file-transfer progress.';
+      if(autoDownload)$('dem-download').click();break;
+    }
+    if(['failed','cancelled'].includes(job.status)){forgetProcessing();$('dem-status').textContent=job.message;break;}
+    await new Promise(resolve=>setTimeout(resolve,1500));
+  }}catch(error){$('dem-status').textContent=error.message+' The job handle is retained; reload to reconnect.';}
+  finally{busy=false;currentDEM=null;$('dem-cancel').hidden=true;controls();}
+}
+async function prepareDEM(){
+  if($('dem-job').disabled)return;
+  const resolution=Number($('dem-resolution').value),survey=$('dem-survey').value,shape=structuredClone(activeArea());
+  const records=items.map((i,n)=>({i,n})).filter(({i})=>surveyKey(i)===survey).map(({i,n})=>({url:i.url,name:filename(i,n),size:Number(i.sizeInBytes)||0}));
+  const center=turf.center(shape).geometry.coordinates,zone=Math.max(1,Math.min(60,Math.floor((center[0]+180)/6)+1));
+  const config={resolution,crs:'EPSG:'+((center[1]>=0?32600:32700)+zone),records,area:shape,geoid:$('county').value,title:$('heading').textContent,survey,mode:$('dem-mode').value};
+  busy=true;controls();$('dem-status').textContent='Connecting to this laptop’s processing worker…';
+  try{const handle=await startProcessing(config);await followDEM(handle);}catch(error){$('dem-status').textContent=error.message;}finally{busy=false;controls();}
+}
+$('dem-cancel').onclick=async()=>{if(currentDEM){await cancelProcessing(currentDEM);$('dem-status').textContent='Cancelling processing…';}};
+const previousDEM=storedProcessing();if(previousDEM)followDEM(previousDEM,false);
+$('dem-mode').onchange=showSurveyChoices;$('dem-resolution').onchange=updateDEM;$('dem-survey').onchange=updateDEM;$('dem-job').onclick=prepareDEM;
 
 init();
 

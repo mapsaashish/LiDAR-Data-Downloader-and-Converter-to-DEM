@@ -7,3 +7,7 @@ __pycache__/
 .DS_Store
 *.tar.gz
 .test-data/
+.runtime/
+.worker-data/
+worker/*.log
+worker/*.pid

@@ -8,11 +8,14 @@ App: https://lidar-atlas-aoi.chirpy-boot-5223.chatgpt.site
 
 - State/county selection using Census TIGERweb boundaries.
 - Draw a polygon or rectangle for a smaller area; drawings are intersected with the county.
+- Hover map tiles for survey, provider, publication/update dates, format, and size; click to pin details and open metadata. Acquisition dates are not inferred from publication dates.
 - Four concurrent USGS catalog requests, bounded retries, full pagination, deterministic deduplication, cancellation, and a background spatial boundary index.
 - Full source LAS/LAZ downloads to a chosen folder in supporting Chrome/Edge browsers, plus a resumable Windows PowerShell downloader.
 - DEM resolution choices of **1 m, 5 m, 10 m, or 30 m**. Pick one source survey to avoid mixing elevation references.
-- Download a self-contained Python conversion job. It downloads/reuses source files, streams ground-classified points through PDAL, mosaics/clips with GDAL, verifies grid resolution, and opens a local GeoTIFF download page.
-- Supabase Auth and PostgreSQL storage for private saved areas and prepared-job history, protected by row-level security.
+- Convert directly in the app with estimated percentage progress, cancellation, reconnect after refresh, and an automatic finished GeoTIFF download.
+- Default AOI-only EPT streaming avoids saving complete LAS/LAZ files; missing streaming sources fail explicitly unless the user chooses full-tile fallback.
+- A loopback-only laptop worker performs PDAL/GDAL processing in bounded raster blocks. Successful streaming jobs remove intermediate rasters.
+- Supabase Auth and PostgreSQL storage for private saved areas and processing-job history, protected by row-level security.
 
 ## Run the React app
 
@@ -38,33 +41,50 @@ Public browser configuration is in `src/supabase.js`; copy `.env.example` to `.e
 
 The connected Supabase project already has the schema applied. `supabase/schema.sql` records the table definitions, ownership policies, and indexes for reproducibility. Do not reapply it blindly to an existing database. `supabase/rls-test.sql` tests owner access and cross-user isolation inside a rolled-back transaction.
 
-`saved_areas` stores county selections and optional GeoJSON areas. `dem_jobs` records prepared conversion jobs; **prepared does not mean conversion completed**. No LiDAR binaries or completed GeoTIFFs are uploaded to Supabase. Users can search/download without signing in; account creation/sign-in is only needed for private saved data. Email confirmation follows the project's Supabase Auth settings.
+`saved_areas` stores county selections and optional GeoJSON areas. `dem_jobs` stores live processing statuses and percentages synchronized by the signed-in browser. Apply `supabase/processing-jobs.sql` after the initial schema when reproducing this backend; it is already applied to the connected project. No LiDAR binaries or completed GeoTIFFs are uploaded to Supabase. Users can search/download without signing in; account creation/sign-in is only needed for private saved data. Email confirmation follows the project's Supabase Auth settings.
 
-## Convert LiDAR to DEM
+## Convert directly to a finished DEM
 
-Conversion is local, not an in-browser or cloud compute service. Install [Miniforge](https://github.com/conda-forge/miniforge), then create an environment:
+The user chooses the area, resolution, and survey, then clicks **Convert & download DEM**. The UI shows estimated processing percentage and phase, offers cancellation, and automatically starts the final `.tif` download at 100%. An explicit download link remains if the browser blocks automatic downloads. The browser's download manager shows file-transfer progress.
 
-```sh
-conda create -n lidar-atlas -c conda-forge python=3.12 pdal gdal
-conda activate lidar-atlas
-python path-to-downloaded-conversion-job.py
+This deployment uses **this laptop as its worker**, as requested. The worker runs at `http://127.0.0.1:8765`, binds only to loopback, allows requests from the app's origin, and protects job status/results with per-job capability tokens. The laptop must remain awake and the worker must be running. A browser may ask for local-network access. Other devices need their own worker; there is no cloud compute server.
+
+The isolated runtime is installed in `.runtime/` (ignored by Git). To restart the already-installed worker after reboot:
+
+```powershell
+./worker/start-worker.ps1
 ```
 
-Choose a destination folder when prompted. The converter resumes cached source files, creates intermediate ground rasters one tile at a time, clips the final GeoTIFF to the selected area, and opens a loopback-only download page. Keep the terminal open while downloading. The file is also already in your chosen folder.
+To stop it:
 
-Processing uses classification 2 (ground), IDW interpolation, a local UTM horizontal CRS, and a bilinear mosaic. Source elevation units and vertical datum are preserved; inspect survey metadata before analysis. NoData remains where ground coverage is absent. Requested pixel size does not imply source accuracy. Full-county 1 m conversion can require substantial storage, time, and RAM; a smaller drawn area is preferable for laptop workflows. Boundary source-tile downloads include complete intersecting tiles; only the DEM is clipped.
+```powershell
+./worker/stop-worker.ps1
+```
+
+For a fresh checkout, install [Miniforge](https://github.com/conda-forge/miniforge), then install the CPU-only runtime:
+
+```sh
+conda create --yes --prefix .runtime --override-channels -c conda-forge python=3.12 libpdal-core gdal
+```
+
+**Stream my area only** is the default. The worker resolves exact and legacy names against the USGS/Entwine inventory, verifies the EPT endpoint for the selected survey, reads only octree nodes intersecting buffered AOI blocks, uses all native point levels (no intentional thinning), filters ground class 2, and produces 1/5/10/30 m IDW rasters in a local UTM CRS. It mosaics and clips the final raster, verifies cell size, and serves the finished GeoTIFF directly. Streaming still transfers required data over the network, but does not store complete `.las`/`.laz` sources. Final rasters and provenance are in `.worker-data/cache`; successful streaming intermediates are removed. Interrupted work keeps reusable intermediate rasters.
+
+For surveys without a verified EPT endpoint, the worker stops with an explanation. The DEM survey selector shows only verified usable sources for streaming mode. Legacy Martin 2015 and Palm Beach 2016 names resolve without switching acquisition years. Full-file downloads only happen when users explicitly select **Download source tiles**. That mode retains source files for reuse. Source elevation units and vertical datum follow the source product; inspect metadata before combining surveys. Missing coverage remains NoData. A finer grid does not imply improved accuracy.
+
+Progress is estimated from completed work units and stage weights; it is not a precise time forecast. Streaming and gridding can remain at the same percentage while a block is processed. A tiny real Orange County AOI was streamed, converted, and downloaded successfully: 11 × 12 pixels at 5 m, valid ground elevations, zero raw LAS/LAZ files saved.
 
 ## Tests and verification
 
 ```sh
 npm test
 python -B dem.test.py
+python -B worker/test_worker.py
 npm run build
 ```
 
 Tests cover pagination completeness, concurrency, retries, cancellation, ordering, polygon holes/islands/boundary intersections, conversion settings, missing tools, reuse, and file-size checks. Live checks returned the same 1,766 Orange County tiles in 6.6 seconds after indexing, versus 27.4 seconds before indexing in that session. Timing depends on USGS and network load. A drawn 87.88 km² area returned 49 tiles and produced a valid 5 m conversion-job configuration.
 
-Full PDAL/GDAL conversion has not been run in the authoring workspace because those executables are not installed. Direct file transfers may be rate-limited or blocked by source-server browser policies; the local download/conversion jobs include retries and resume support.
+Real PDAL/GDAL streaming conversion and final HTTP file download have been verified on this laptop. Whole-county conversion is not benchmarked; time and disk needs depend on area, resolution, source density, and network conditions.
 
 ## Sources
 

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""LiDAR Atlas local DEM conversion job. Run in a PDAL/GDAL environment.
-
-Suggested environment (install Miniforge first if needed):
-  conda create -n lidar-atlas -c conda-forge python=3.12 pdal gdal
-  conda activate lidar-atlas
-  python this-downloaded-file.py
-"""
+"""PDAL/GDAL full-source fallback used internally by the laptop worker."""
 import base64
 import hashlib
 import html
@@ -21,19 +15,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 import webbrowser
 
-CONFIG_B64 = "__LIDAR_ATLAS_CONFIG__"
+
 
 
 def pipeline(source, destination, config):
-    return {"pipeline": [
+    stages = [
         {"type": "readers.las", "filename": str(source)},
         {"type": "filters.expression", "expression": "Classification == 2"},
         {"type": "filters.reprojection", "out_srs": config["crs"]},
+    ]
+    if config.get("crop_wkt"):
+        stages.append({"type": "filters.crop", "polygon": config["crop_wkt"]})
+    stages += [
         {"type": "writers.gdal", "filename": str(destination),
          "resolution": config["resolution"], "radius": config["resolution"] * math.sqrt(2),
          "output_type": "idw", "data_type": "float", "nodata": -9999,
+         "allow_empty": True,
          "gdalopts": "TILED=YES,COMPRESS=DEFLATE,BIGTIFF=IF_SAFER"}
-    ]}
+    ]
+    return {"pipeline": stages}
 
 
 def run(args):
@@ -49,14 +49,14 @@ def acquire(record, destination):
     if partial.exists() and expected > 0 and partial.stat().st_size == expected:
         partial.replace(destination)
         return
-    run(["curl", "--fail", "--location", "--retry", "6", "--retry-delay", "10",
+    run(["curl", "--silent", "--show-error", "--fail", "--location", "--retry", "6", "--retry-delay", "10",
          "--connect-timeout", "60", "--continue-at", "-", "--output", partial, record["url"]])
     if expected > 0 and partial.stat().st_size != expected:
         raise RuntimeError("Source size differs from catalog: " + destination.name)
     partial.replace(destination)
 
 
-def build_dem(config, folder):
+def build_dem(config, folder, progress=lambda *args: None):
     resolution = config["resolution"]
     if resolution not in (1, 5, 10, 30):
         raise ValueError("Choose a resolution of 1, 5, 10, or 30 metres.")
@@ -74,10 +74,24 @@ def build_dem(config, folder):
     records = config["records"]
     if not records:
         raise ValueError("No LiDAR source tiles selected.")
+    # Crop points before gridding, which keeps small-AOI jobs small even when
+    # the provider's complete source tile extends far beyond the drawn area.
+    from osgeo import ogr, osr
+    source_crs = osr.SpatialReference()
+    source_crs.ImportFromEPSG(4326)
+    source_crs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    target_crs = osr.SpatialReference()
+    target_crs.SetFromUserInput(config["crs"])
+    target_crs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    crop = ogr.CreateGeometryFromJson(json.dumps(config["area"]["geometry"]))
+    crop.Transform(osr.CoordinateTransformation(source_crs, target_crs))
+    config = {**config, "crop_wkt": crop.Buffer(3 * resolution).ExportToWkt()}
     for index, record in enumerate(records):
         print(f"\n[{index + 1}/{len(records)}] Download / convert {record['name']}", flush=True)
         source = folder / record["name"]
+        progress("downloading", index, len(records), source, record)
         acquire(record, source)
+        progress("converting", index, len(records), source, record)
         raster = work / (record["name"] + ".tif")
         complete = work / (record["name"] + ".complete")
         if not (raster.exists() and complete.exists()):
@@ -86,10 +100,15 @@ def build_dem(config, folder):
             # Streaming avoids loading the entire LAS/LAZ tile into RAM.
             run(["pdal", "pipeline", job, "--stream"])
             if not raster.exists():
-                raise RuntimeError("No ground raster produced. Source must contain ground-classified points (class 2).")
+                progress("tile_complete", index + 1, len(records), source, record)
+                continue
             run(["gdalinfo", "-mm", raster])
             complete.write_text("Complete", encoding="utf-8")
         rasters.append(raster)
+        progress("tile_complete", index + 1, len(records), source, record)
+    if not rasters:
+        raise RuntimeError("No ground-classified points were found inside this area. Choose another area or survey.")
+    progress("mosaicking", len(records), len(records), None, None)
     listing = work / "rasters.txt"
     listing.write_text("\n".join(str(p) for p in rasters) + "\n", encoding="utf-8")
     mosaic = work / "mosaic.vrt"
@@ -107,65 +126,10 @@ def build_dem(config, folder):
     if len(transform) != 6 or not math.isclose(abs(transform[1]), resolution) or not math.isclose(abs(transform[5]), resolution):
         raise RuntimeError("Output raster resolution verification failed.")
     staging.replace(output)
+    progress("verifying", len(records), len(records), None, None)
     provenance = {**config, "output": output.name, "method": "Ground class 2, per-tile IDW; bilinear mosaic clipped to AOI", "nodata": -9999,
                   "vertical_reference": "Source elevation units and vertical datum are preserved. Confirm survey metadata before analysis.",
                   "coverage": "NoData is retained where ground coverage is absent. Pixel size does not imply vertical accuracy."}
     output.with_suffix(".json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
     return output
 
-
-def serve_result(output):
-    token = secrets.token_urlsafe(24)
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            route = urlparse(self.path).path
-            if route == "/" + token:
-                body = ("<!doctype html><title>Your DEM is ready</title><main style='font:18px system-ui;max-width:700px;margin:80px auto'>"
-                        "<h1>Your DEM is ready.</h1><p>GeoTIFF saved to " + html.escape(str(output)) + "</p>"
-                        "<p><a href='/" + token + "/dem'>Download converted DEM (.tif)</a></p>"
-                        "<p>Missing ground coverage remains NoData. Keep this terminal open while downloading.</p></main>").encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif route == "/" + token + "/dem":
-                self.send_response(200)
-                self.send_header("Content-Type", "image/tiff")
-                self.send_header("Content-Disposition", 'attachment; filename="' + output.name + '"')
-                self.send_header("Content-Length", str(output.stat().st_size))
-                self.end_headers()
-                with output.open("rb") as stream:
-                    shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
-            else:
-                self.send_error(404)
-
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-        url = f"http://127.0.0.1:{server.server_port}/{token}"
-        print("\nDEM complete:", output, "\nDownload page:", url, "\nPress Ctrl+C to stop the download page.", flush=True)
-        webbrowser.open(url)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-
-
-def main():
-    config = json.loads(base64.b64decode(CONFIG_B64))
-    print(config["title"], "|", config["resolution"], "m |", config["crs"], "|", len(config["records"]), "source tiles")
-    print("Only ground-classified points are used. Elevation units/datum follow the source survey.")
-    folder = input("Folder for source tiles and converted DEM (existing Atlas download folder can be reused): ").strip().strip('"')
-    if not folder:
-        raise ValueError("A destination folder is required.")
-    output = build_dem(config, folder)
-    serve_result(output)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (Exception, KeyboardInterrupt) as error:
-        print("\nConversion stopped:", error, file=sys.stderr)
-        print("Completed source files and tile rasters are retained. Rerun this job to resume.", file=sys.stderr)
-        sys.exit(1)

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("converter", Path(__file__).parent / "public" / "dem-converter.py")
+spec = importlib.util.spec_from_file_location("converter", Path(__file__).parent / "worker" / "converter.py")
 converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 

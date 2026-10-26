@@ -1,0 +1,8 @@
+name: lidar-atlas-worker
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.16
+  - libpdal-core=2.10.2
+  - gdal=3.13.3
+  - libblas=*=*openblas
