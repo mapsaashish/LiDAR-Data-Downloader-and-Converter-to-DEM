@@ -72,4 +72,3 @@ Full PDAL/GDAL conversion has not been run in the authoring workspace because th
 - [Census TIGERweb](https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer)
 - [PDAL raster writer](https://pdal.io/en/stable/stages/writers.gdal.html)
 - [GDAL raster clipping](https://gdal.org/en/stable/programs/gdalwarp.html)
-

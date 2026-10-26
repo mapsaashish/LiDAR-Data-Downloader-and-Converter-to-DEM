@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.local
+__pycache__/
+*.pyc
+.DS_Store
+*.tar.gz
+.test-data/
