@@ -47,7 +47,7 @@ The connected Supabase project already has the schema applied. `supabase/schema.
 
 The user chooses the area, resolution, and survey, then clicks **Convert & download DEM**. The UI shows estimated processing percentage and phase, offers cancellation, and automatically starts the final `.tif` download at 100%. An explicit download link remains if the browser blocks automatic downloads. The browser's download manager shows file-transfer progress.
 
-This deployment uses **this laptop as its worker**, as requested. The worker runs at `http://127.0.0.1:8765`, binds only to loopback, allows requests from the app's origin, and protects job status/results with per-job capability tokens. The laptop must remain awake and the worker must be running. A browser may ask for local-network access. Other devices need their own worker; there is no cloud compute server.
+This deployment uses **this laptop as its worker**, as requested. The worker runs at `http://127.0.0.1:8765`, binds only to loopback, allows requests from the app's origin, and protects job status/results with per-job capability tokens. Open **http://127.0.0.1:8765/** on this laptop for the full React app and processing API on the same origin. The laptop must remain awake and the worker must be running. Hosted pages may be blocked from calling localhost by browser local-network rules; the laptop app avoids this restriction. Other devices need their own worker; there is no cloud compute server.
 
 The isolated runtime is installed in `.runtime/` (ignored by Git). To restart the already-installed worker after reboot:
 

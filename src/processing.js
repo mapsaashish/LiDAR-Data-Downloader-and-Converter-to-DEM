@@ -3,7 +3,7 @@ const KEY='lidar:active-dem:v2';
 export async function workerRequest(path,options={}){
   let response;
   try{response=await fetch(WORKER+path,{...options,signal:options.signal||AbortSignal.timeout(15000)});}
-  catch{throw Error('Cannot reach this laptop’s processing worker. Start worker/start-worker.ps1 and allow local-network access in your browser if requested.');}
+  catch{throw Error('Cannot reach this laptop’s processing worker. If it is running, open the laptop app at http://127.0.0.1:8765 to avoid browser cross-network restrictions. Otherwise run worker/start-worker.ps1.');}
   const data=await response.json();if(!response.ok)throw Error(data.error||'Worker request failed');return data;
 }
 export async function startProcessing(config){

@@ -5,6 +5,7 @@ import concurrent.futures
 import hashlib
 import importlib.util
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -22,7 +23,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / '.worker-data'
 DATA.mkdir(exist_ok=True)
-ORIGINS = {'https://lidar-atlas-aoi.chirpy-boot-5223.chatgpt.site', 'http://127.0.0.1:4174', 'http://127.0.0.1:5173'}
+ORIGINS = {'https://lidar-atlas-aoi.chirpy-boot-5223.chatgpt.site', 'http://127.0.0.1:4174', 'http://127.0.0.1:5173', 'http://127.0.0.1:8765'}
 os.environ['PATH'] = os.pathsep.join([str(Path(sys.prefix)/'Library'/'bin'), str(Path(sys.prefix)/'Scripts'), sys.prefix, os.environ.get('PATH','')])
 os.environ.setdefault('GDAL_DATA', str(Path(sys.prefix)/'Library'/'share'/'gdal'))
 os.environ.setdefault('PROJ_DATA', str(Path(sys.prefix)/'Library'/'share'/'proj'))
@@ -171,6 +172,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         route=urlparse(self.path).path
+        if route=='/' or route.startswith('/assets/') or route in ('/filter-worker.js','/spatial.js'):
+            target=(ROOT/'dist'/('index.html' if route=='/' else route.lstrip('/'))).resolve()
+            if not target.is_relative_to((ROOT/'dist').resolve()) or not target.is_file():return self.reply({'error':'App file not found. Build the React app first.'},404)
+            self.send_response(200)
+            content_type='application/javascript' if target.suffix=='.js' else mimetypes.guess_type(str(target))[0] or 'application/octet-stream'
+            self.send_header('Content-Type',content_type);self.send_header('Content-Length',str(target.stat().st_size))
+            self.send_header('Cache-Control','no-cache');self.end_headers()
+            with target.open('rb') as stream:shutil.copyfileobj(stream,self.wfile)
+            return
         if route=='/health':
             ready=all(shutil.which(p) for p in ('pdal','gdalwarp','gdalbuildvrt','gdalinfo','curl'))
             return self.reply({'online':True,'ready':ready,'version':2,'worker':'This laptop','active':sum(j['status'] not in ('complete','failed','cancelled') for j in jobs.values())})
