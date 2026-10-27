@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 import streaming
+import relay
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -79,6 +80,8 @@ def update(job, **values):
 def command(args):
     job=local.job
     with (DATA/job['id']/'processing.log').open('ab') as log:
+        log.write(('\nRunning '+str(args[0])+'\n').encode());log.flush()
+        start=log.tell()
         proc=subprocess.Popen([str(a) for a in args],stdout=log,stderr=log,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         while proc.poll() is None:
             if job['cancel'].wait(.25):
@@ -94,9 +97,12 @@ def command(args):
                 fraction=min(1,size/record['size']) if record['size'] else 0
                 percent=2+88*(job['completed_tiles']+.65*fraction)/job['total_tiles']
                 update(job,percent=round(percent,1),message=f"Downloading tile {job['completed_tiles']+1}/{job['total_tiles']} · {size/1e6:.1f} MB")
+        proc.wait();log.flush()
         if proc.returncode:
-            text=(DATA/job['id']/'processing.log').read_text(encoding='utf-8',errors='replace')[-1800:]
-            raise RuntimeError('Processing command failed: '+text)
+            with (DATA/job['id']/'processing.log').open('rb') as source:
+                source.seek(start);text=source.read().decode('utf-8',errors='replace').strip()[-1800:]
+            code=proc.returncode
+            raise RuntimeError(f'{Path(str(args[0])).name} failed (exit {code}, 0x{code & 0xffffffff:08X}). '+(text or 'The native process exited without diagnostic output. Completed blocks remain cached.'))
 
 
 converter.run=command
@@ -120,11 +126,13 @@ def process(job,config):
                 update(job,status=stage,percent=round(2+88*(index+.65)/count,1),message=f'Converting ground points · tile {index+1}/{count}')
             elif stage=='streaming':
                 update(job,status='streaming',percent=round(2+88*index/count,1),total_tiles=count,completed_tiles=index,message=f'Streaming and converting area block {index+1}/{count}. No full source tiles saved.')
+            elif stage=='retrying':
+                update(job,status='streaming',message=f'Retrying area block {index+1}/{count} after a network/process failure (attempt {record["attempt"]}/4). Completed blocks remain cached.')
             elif stage=='tile_complete':
                 update(job,percent=round(2+88*index/count,1),completed_tiles=index,message=f'Processed {index}/{count} source tiles')
             elif stage=='mosaicking': update(job,status=stage,percent=92,message='Assembling and clipping the final GeoTIFF…')
             elif stage=='verifying': update(job,status=stage,percent=98,message='Verifying GeoTIFF and requested cell size…')
-        output=streaming.build(config,DATA/'cache',progress,command) if config.get('mode','stream')=='stream' else converter.build_dem(config,DATA/'cache',progress)
+        output=streaming.build(config,DATA/'cache',progress,command,relay_base='http://127.0.0.1:8765/ept') if config.get('mode','stream')=='stream' else converter.build_dem(config,DATA/'cache',progress)
         update(job,status='complete',percent=100,message='DEM verified. Starting final file download.',output=str(output),output_name=output.name,output_bytes=output.stat().st_size)
     except Exception as error:
         cancelled=job['cancel'].is_set()
@@ -170,8 +178,45 @@ class Handler(BaseHTTPRequestHandler):
         token=self.headers.get('Authorization','').removeprefix('Bearer ') or query.get('token',[''])[0]
         return job if secrets.compare_digest(token,job['token']) else None
 
+    def do_HEAD(self):
+        route=urlparse(self.path).path
+        if not route.startswith('/ept/'):
+            self.send_response(404);self.end_headers();return
+        try:
+            size=relay.block_size(route)
+            self.send_response(200);self.send_header('Content-Length',str(size));self.send_header('Accept-Ranges','bytes');self.end_headers()
+        except Exception as error:
+            self.log_message('Streaming HEAD failed: %s',str(error));self.send_response(502);self.end_headers()
+
     def do_GET(self):
         route=urlparse(self.path).path
+        if route.startswith('/ept/'):
+            try:
+                buffer,size=relay.fetch_block(route)
+                with buffer:
+                    start,end=0,size-1
+                    requested=self.headers.get('Range')
+                    if requested:
+                        match=re.fullmatch(r'bytes=(\d*)-(\d*)',requested)
+                        if not match:raise ValueError('Invalid range request.')
+                        start=int(match[1]) if match[1] else max(0,size-int(match[2]))
+                        end=min(size-1,int(match[2])) if match[1] and match[2] else size-1
+                        if start>=size or start>end:
+                            self.send_response(416);self.send_header('Content-Range',f'bytes */{size}');self.end_headers();return
+                    self.send_response(206 if requested else 200)
+                    self.send_header('Content-Length',str(end-start+1));self.send_header('Accept-Ranges','bytes')
+                    if requested:self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
+                    self.end_headers();buffer.seek(start);remaining=end-start+1
+                    while remaining:
+                        chunk=buffer.read(min(256*1024,remaining))
+                        if not chunk:break
+                        self.wfile.write(chunk);remaining-=len(chunk)
+                return
+            except (BrokenPipeError,ConnectionResetError,ConnectionAbortedError):return
+            except ValueError as error:return self.reply({'error':str(error)},400)
+            except Exception as error:
+                self.log_message('Streaming relay failed: %s: %s',route,str(error))
+                return self.reply({'error':'Unable to read the requested USGS streaming block.'},502)
         if route=='/' or route.startswith('/assets/') or route in ('/filter-worker.js','/spatial.js'):
             target=(ROOT/'dist'/('index.html' if route=='/' else route.lstrip('/'))).resolve()
             if not target.is_relative_to((ROOT/'dist').resolve()) or not target.is_file():return self.reply({'error':'App file not found. Build the React app first.'},404)
@@ -230,6 +275,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reply({'error':'Worker queue is full. Wait for an existing job.'},429)
                     job={'id':str(uuid.uuid4()),'token':secrets.token_urlsafe(32),'status':'queued','percent':0,'message':'Queued on this laptop.','created_at':time.time(),'cancel':threading.Event(),'completed_tiles':0,'total_tiles':len(config['records'])}
                     jobs[job['id']]=job;update(job)
+                    (DATA/job['id']/'config.json').write_text(json.dumps(config),encoding='utf-8')
                     pool.submit(process,job,config)
                 return self.reply({**public(job),'token':job['token']},202)
             except (ValueError,TypeError,KeyError) as error:return self.reply({'error':str(error)},400)

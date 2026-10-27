@@ -73,6 +73,8 @@ For surveys without a verified EPT endpoint, the worker stops with an explanatio
 
 Progress is estimated from completed work units and stage weights; it is not a precise time forecast. Streaming and gridding can remain at the same percentage while a block is processed. A tiny real Orange County AOI was streamed, converted, and downloaded successfully: 11 × 12 pixels at 5 m, valid ground elevations, zero raw LAS/LAZ files saved.
 
+The laptop worker relays EPT requests through Python's validated HTTPS client, including HEAD and byte-range support, to avoid native PDAL HTTP failures on Windows. Transient block transfers and failed processing blocks have bounded retries. A 64 MB in-memory LRU prevents repeated range reads from transferring the same block repeatedly; larger temporary buffers are discarded after use. Missing or unreadable source blocks still fail the job rather than silently produce an incomplete DEM. Failure messages include the command and exit code. Completed raster blocks remain cached for retries. The exact Palm Beach block that previously failed was reproduced and then verified through the relay as a valid 1000 × 1000 raster at 1 m resolution.
+
 ## Tests and verification
 
 ```sh

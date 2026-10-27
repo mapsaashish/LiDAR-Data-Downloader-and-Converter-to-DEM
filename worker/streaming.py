@@ -58,7 +58,20 @@ def ept_sources(records):
     return sources
 
 
-def build(config,folder,progress,run):
+def process_block(job,target,marker,index,total,progress,run):
+    marker.unlink(missing_ok=True)
+    for attempt in range(4):
+        target.unlink(missing_ok=True)
+        try:
+            run(['pdal','pipeline',job,'--stream'])
+            return
+        except Exception:
+            if attempt==3:raise
+            progress('retrying',index,total,None,{'attempt':attempt+2})
+            time.sleep(2**attempt)
+
+
+def build(config,folder,progress,run,relay_base=None):
     from osgeo import ogr,osr,gdal
     sources=ept_sources(config['records'])
     resolution=config['resolution']
@@ -86,14 +99,15 @@ def build(config,folder,progress,run):
         target=work/f'block-{n:07d}.tif';marker=target.with_suffix('.complete')
         if not(target.exists() and marker.exists()):
             read_area=area.Intersection(poly).Buffer(resolution*3)
-            stages=[{'type':'readers.ept','filename':source,'polygon':read_area.ExportToWkt()+'/'+config['crs'],'requests':4},
+            reader_source=relay_base+'/'+source.split('/')[-2]+'/ept.json' if relay_base else source
+            stages=[{'type':'readers.ept','filename':reader_source,'polygon':read_area.ExportToWkt()+'/'+config['crs'],'requests':4},
                     {'type':'filters.expression','expression':'Classification == 2'},
                     {'type':'filters.reprojection','out_srs':config['crs']},
                     {'type':'writers.gdal','filename':str(target),'resolution':resolution,'radius':resolution*math.sqrt(2),'output_type':'idw','data_type':'float','nodata':-9999,'allow_empty':True,
                      'origin_x':left,'origin_y':bottom,'width':int(block/resolution),'height':int(block/resolution),
                      'gdalopts':'TILED=YES,COMPRESS=DEFLATE,BIGTIFF=IF_SAFER'}]
             job=work/'pipeline.json';job.write_text(json.dumps({'pipeline':stages}),encoding='utf-8')
-            run(['pdal','pipeline',job,'--stream'])
+            process_block(job,target,marker,n,len(tasks),progress,run)
             if target.exists():marker.write_text('Complete',encoding='utf-8')
         if target.exists():rasters.append(target)
         progress('tile_complete',n+1,len(tasks),None,None)
